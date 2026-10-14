@@ -401,19 +401,27 @@ class BidQClient:
         self.timeout = min(max(timeout, 1), 30)
         self._authenticated = False
         self.stage = '연결 준비'
+        self._detail_response_cache = {}
 
     def close(self):
         self.password = self.userid = None
+        self._authenticated = False
+        self._detail_response_cache.clear()
         self.session.close()
 
     def _request(self, method, path, **kwargs):
         url = urljoin(BASE, path)
         if urlparse(url).scheme != 'https' or urlparse(url).hostname not in {'bidq.co.kr', 'www.bidq.co.kr'}:
             raise CollectionError('비드큐 이외의 주소는 조회하지 않습니다.')
+        cache_key = url if self._authenticated and method.upper() == 'GET' and (urlparse(url).path in {'/bidq/bids/detail/bid', '/bidq/bids/detail/suc'}) and (not kwargs.get('params')) and (not kwargs.get('data')) and (not kwargs.get('json')) else None
+        if cache_key is not None and cache_key in self._detail_response_cache:
+            return self._detail_response_cache[cache_key]
         for _ in range(6):
             response = self.session.request(method, url, timeout=self.timeout, allow_redirects=False, **kwargs)
             response.raise_for_status()
             if response.status_code not in {301, 302, 303, 307, 308}:
+                if cache_key is not None and url == cache_key and (response.status_code == 200):
+                    self._detail_response_cache[cache_key] = response
                 return response
             url = urljoin(url, response.headers.get('Location', ''))
             redirected = urlparse(url)
