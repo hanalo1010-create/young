@@ -207,7 +207,7 @@ def report_analysis(notice, rows, cost_floor=None):
 import calendar
 import re
 from datetime import date, datetime, timezone, timedelta
-from urllib.parse import urljoin, urlparse, parse_qs, quote
+from urllib.parse import urljoin, urlparse, parse_qs, quote, urlunparse
 import requests
 from bs4 import BeautifulSoup
 BASE = 'https://www.bidq.co.kr'
@@ -416,8 +416,13 @@ class BidQClient:
             if response.status_code not in {301, 302, 303, 307, 308}:
                 return response
             url = urljoin(url, response.headers.get('Location', ''))
-            if urlparse(url).hostname not in {'bidq.co.kr', 'www.bidq.co.kr'} or urlparse(url).scheme != 'https':
-                raise CollectionError('외부 서비스로의 리디렉션을 차단했습니다.')
+            redirected = urlparse(url)
+            if redirected.hostname not in {'bidq.co.kr', 'www.bidq.co.kr'}:
+                raise CollectionError('비드큐 외부 주소 이동 차단 (대상: ' + (redirected.hostname or '미확인') + ')')
+            if redirected.scheme == 'http':
+                url = urlunparse(redirected._replace(scheme='https'))
+            elif redirected.scheme != 'https':
+                raise CollectionError('비드큐 주소 이동의 통신 방식 미지원')
             if response.status_code in {301, 302, 303}:
                 method, kwargs = ('GET', {})
         raise CollectionError('리디렉션 횟수 초과')
