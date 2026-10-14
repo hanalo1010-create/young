@@ -332,7 +332,7 @@ def parse_notice(html, url, expected_number=None):
                 break
     base = client_number(choose(fields, '기초금액', '기초가격'))
     planned = client_number(choose(fields, '예정가격', '예정금액'))
-    floor = client_number(choose(fields, '낙찰하한율', '낙찰하한'))
+    floor = client_number(choose(fields, '낙찰하한율', '낙찰하한률', '낙찰하한'))
     variation = choose(fields, '예가변동폭', '예가변동', '예가범위')
     deadline = choose(fields, '입찰마감일시', '투찰마감일시', '입찰마감', '투찰마감', '마감일시')
     opening = choose(fields, '개찰일시', '개찰일', '개찰일자')
@@ -369,7 +369,7 @@ def canonical_row(raw):
     notice_id = choose(raw, 'notinum', 'notice', 'notice_number', 'notice_no', 'constno', 'bidno', '공고번호')
     title = choose(raw, 'constnm', 'title', '공고명') or ''
     commodity, commodity_source = commodity_classification(choose(raw, 'commodity', 'itemname', '품목'), title)
-    return {'notice_number': notice_id, 'notice': notice_id, 'id': notice_id, 'bidid': choose(raw, 'bidid', 'bid_id'), 'date': iso_day(choose(raw, 'constdt', 'date', '개찰일')), 'name': choose(raw, 'org', 'orgnm', 'org_name', '발주기관'), 'title': title, 'commodity': commodity, 'commodity_source': commodity_source, 'base': base, 'planned': planned, 'planned_rate': planned / base * 100 if base and planned else None, 'winning': client_number(choose(raw, 'success1', 'winning_price', 'winning', '낙찰금액')), 'floor': client_number(choose(raw, 'floor', 'lower_limit_rate', '낙찰하한율')), 'participants': client_number(choose(raw, 'innum', 'participants', '참여업체수')), 'reported_success_pct_unverified': raw.get('success_pct'), 'raw': raw}
+    return {'notice_number': notice_id, 'notice': notice_id, 'id': notice_id, 'bidid': choose(raw, 'bidid', 'bid_id'), 'date': iso_day(choose(raw, 'constdt', 'date', '개찰일')), 'name': choose(raw, 'org', 'orgnm', 'org_name', '발주기관'), 'title': title, 'commodity': commodity, 'commodity_source': commodity_source, 'base': base, 'planned': planned, 'planned_rate': planned / base * 100 if base and planned else None, 'winning': client_number(choose(raw, 'success1', 'winning_price', 'winning', '낙찰금액')), 'floor': client_number(choose(raw, 'floor', 'lower_limit_rate', '낙찰하한율', '낙찰하한률')), 'participants': client_number(choose(raw, 'innum', 'participants', '참여업체수')), 'reported_success_pct_unverified': raw.get('success_pct'), 'raw': raw}
 
 def multiple_estimates(raw):
     cells = raw.get('multispares_pct')
@@ -400,6 +400,7 @@ class BidQClient:
         self.today = today or datetime.now(timezone(timedelta(hours=9))).date()
         self.timeout = min(max(timeout, 1), 30)
         self._authenticated = False
+        self.stage = '연결 준비'
 
     def close(self):
         self.password = self.userid = None
@@ -422,6 +423,7 @@ class BidQClient:
         raise CollectionError('리디렉션 횟수 초과')
 
     def login(self):
+        self.stage = '비드큐 로그인'
         response = self._request('GET', '/bidq/member/login/index')
         soup = BeautifulSoup(response.text, 'html.parser')
         token = soup.find('meta', attrs={'name': 'csrf-token'})
@@ -440,6 +442,7 @@ class BidQClient:
         return list(dict.fromkeys((urljoin(BASE, a['href']) for a in soup.select('a[href]') if re.search('/bidq/bids/detail/(?:bid|suc)\\?', a['href']))))
 
     def find_notice(self, notice_number):
+        self.stage = '공고 검색·상세 확인'
         found = []
         for kind in ('bid', 'suc'):
             search = self._request('GET', '/bidq/bids/list', params={'bidtype': 'pur', 'bid_suc': kind, 'searchWord': notice_number, 'word_type': 'all_Search', 'subWord': notice_number})
@@ -567,6 +570,7 @@ class BidQClient:
         notice = self.find_notice(notice_number.strip())
         if not notice['name']:
             raise CollectionError('발주기관 미확인')
+        self.stage = '학교명·변경 전후 발주처 연결'
         names, alias_verified = self.discover_names(notice['name'])
         for name in legacy_names or []:
             if school_token(name) != school_token(notice['name']):
@@ -576,6 +580,7 @@ class BidQClient:
                 alias_verified = False
         raw_rows, parts, alias_counts = ([], [], [])
         for name in names:
+            self.stage = '24개월 발주처 분석 수집'
             found, scope = self._opened([name], start, self.today)
             raw_rows.extend(found)
             parts.append(scope)
@@ -583,6 +588,7 @@ class BidQClient:
         org = {'status': 'complete', 'total': sum((part.get('total', 0) for part in parts)), 'collected': len(raw_rows), 'by_institution': alias_counts, 'parts': parts, 'start': start.isoformat(), 'end': self.today.isoformat(), 'names': names}
         frequency_rows, frequency_parts = ([], [])
         for name in names:
+            self.stage = '24개월 사정률 분석 수집'
             found, scope = self._opened([name], start, self.today, 'freq')
             params = self._params([name], start, self.today, 'freq')
             freq = self._request('POST', '/bidq/analysis/common-api/org-point-freq48', json=params, headers={'Origin': BASE, 'Referer': BASE + '/bidq/analysis/freq'}).json()
@@ -761,6 +767,7 @@ from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import streamlit as st
+import requests
 ROOT = Path(__file__).parent
 KST = ZoneInfo('Asia/Seoul')
 METHOD_LABELS = {'fixed_100': '100% 기준', 'all_mean': '동일 하한율 기관 평균', 'item_mean': '동일 품목 평균', 'item_median': '동일 품목 중앙값', 'recent_item3': '최근 3개 개찰일 평균', 'low_scenario': '낮은 예가 민감도', 'high_scenario': '높은 예가 민감도'}
@@ -795,12 +802,26 @@ def collect(number, userid, password, aliases):
     client = BidQClient(userid, password, today=datetime.now(KST).date())
     try:
         return client.collect(number, legacy_names=aliases, months=24)
+    except CollectionError as error:
+        raise CollectionError(f"{getattr(client, 'stage', '자료 수집')}: {error}") from None
+    except requests.exceptions.Timeout:
+        raise CollectionError(f"{getattr(client, 'stage', '자료 수집')}: 비드큐 응답 시간 초과") from None
+    except requests.exceptions.HTTPError as error:
+        status = error.response.status_code if error.response is not None else '미확인'
+        raise CollectionError(f"{getattr(client, 'stage', '자료 수집')}: 비드큐 HTTP {status}") from None
+    except requests.exceptions.RequestException:
+        raise CollectionError(f"{getattr(client, 'stage', '자료 수집')}: 비드큐 통신 또는 응답 형식 오류") from None
     finally:
         client.close()
 
 def collect_analyze(number, userid, password, aliases, cost_floor, api_key, model):
     bundle = collect(number, userid, password, aliases)
-    report = analyze(bundle, cost_floor)
+    try:
+        report = analyze(bundle, cost_floor)
+    except (ValueError, KeyError, TypeError):
+        missing = [label for key, label in (('base', '기초금액'), ('floor', '낙찰하한율'), ('variation', '예가변동폭')) if bundle.get('notice', {}).get(key) is None]
+        message = '공고 필수 항목 미확인: ' + ', '.join(missing) if missing else '원자료의 금액·날짜·조건 검증 실패'
+        raise CollectionError('금액 검산: ' + message) from None
     if api_key:
         try:
             bundle['gemini_review'] = review_candidates(api_key, model, bundle['notice'], report)
@@ -904,8 +925,10 @@ with live:
                             st.session_state['results'].append((bundle, report))
                             remember(bundle, report)
                             st.write(f"{bundle['notice'].get('name', number)}: {report['main_candidate']['price']:,}원 ({report['status']})")
+                        except CollectionError as error:
+                            st.error(f'{number}: {error}. 확인되지 않은 자료로 가격을 만들지 않습니다.')
                         except Exception:
-                            st.error(f'{number}: 수집·검증 실패. 부분 자료를 최종 추천으로 사용하지 않습니다.')
+                            st.error(f'{number}: 앱 내부 처리 오류. 수집·검산 코드 점검이 필요합니다.')
     for index, (bundle, report) in enumerate(st.session_state.get('results', [])):
         display(bundle, report, f'live_{index}')
 with imported:
