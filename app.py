@@ -1,9 +1,12 @@
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, localcontext
 from statistics import median
+import hashlib
+import json
 D = Decimal
 METHODS = ('fixed_100', 'all_mean', 'item_mean', 'item_median', 'recent_item3')
 COUNTERFACTUAL = '기록된 예정가격·타 업체 가격을 고정한 가상 비교이며 실제 낙찰 결과가 아님'
+ENGINE_VERSION = '2026-10-15.condition-scoped-v2'
 
 def core_number(value, name='number'):
     if isinstance(value, bool) or value is None:
@@ -129,14 +132,15 @@ def _summary(evaluations):
         output[row['outcome']] += 1
     return output
 
-def walk_forward(rows):
+def walk_forward(rows, commodity=None, floor=None):
     """Predeclared methods, strict prior-date input, chronological holdout."""
     rows = normalize_records(rows)
-    dates = sorted({r['date'] for r in rows})
+    targets = [r for r in rows if (commodity is None or r['commodity'] == commodity) and (floor is None or r['floor'] == _floor(floor))]
+    dates = sorted({r['date'] for r in targets})
     split = max(1, int(len(dates) * 0.7))
     train_dates = set(dates[:split])
     evaluations = {method: [] for method in METHODS}
-    for target in rows:
+    for target in targets:
         prior = [r for r in rows if r['date'] < target['date']]
         for method, rate in candidate_methods(prior, target['commodity'], target['floor']).items():
             result = evaluate_historical(target, rate)
@@ -160,7 +164,7 @@ def walk_forward(rows):
     measured, baseline = (held['method'], held['baseline_same_notices'])
     held_dates = {r['date'] for r in evaluations[chosen] if r['phase'] == 'holdout'}
     superiority = chosen != 'fixed_100' and len(dates) >= 12 and (len(held_dates) >= 5) and (measured['first_unknown'] == 0) and (measured['mae'] < baseline['mae']) and (measured['below_floor'] <= baseline['below_floor']) and (measured['at_or_below_first'] > baseline['at_or_below_first'])
-    return {'selected_on_training': chosen, 'selected_method': chosen if superiority else 'fixed_100', 'verified_superiority': superiority, 'confidence': 'limited' if superiority else 'low', 'summaries': summaries, 'evaluations': evaluations, 'training_dates': sorted(train_dates), 'holdout_dates': dates[split:], 'selection_common_notices': sorted(common_ids), 'interpretation': COUNTERFACTUAL, 'selection_rule': '사전 정의 후보의 학습 MAE로 1개 선택, 별도 평가에서 단순 기준 대비 오차·가격경쟁 개선 확인; 우위 불명확 시 100%'}
+    return {'selected_on_training': chosen, 'selected_method': chosen if superiority else 'fixed_100', 'verified_superiority': superiority, 'confidence': 'limited' if superiority else 'low', 'summaries': summaries, 'evaluations': evaluations, 'training_dates': sorted(train_dates), 'holdout_dates': dates[split:], 'selection_common_notices': sorted(common_ids), 'target_scope': {'commodity': commodity, 'floor': floor, 'records': len(targets), 'independent_dates': len(dates)}, 'interpretation': COUNTERFACTUAL, 'selection_rule': '사전 정의 후보의 학습 MAE로 1개 선택, 별도 평가에서 단순 기준 대비 오차·가격경쟁 개선 확인; 우위 불명확 시 100%'}
 
 def report_analysis(notice, rows, cost_floor=None):
     base, floor = (_money(notice['base'], '기초금액'), _floor(notice['floor']))
@@ -174,7 +178,7 @@ def report_analysis(notice, rows, cost_floor=None):
         start = cutoff_date.replace(year=cutoff_date.year - 2, day=28).isoformat()
     history = [r for r in normalized if start <= r['date'] < cutoff]
     methods = candidate_methods(history, notice['commodity'], floor)
-    validation = walk_forward(history)
+    validation = walk_forward(history, notice['commodity'], floor)
     chosen = validation['selected_method']
     if chosen not in methods:
         chosen = 'fixed_100'
@@ -194,6 +198,11 @@ def report_analysis(notice, rows, cost_floor=None):
     coverage.update({'collected_rows': len(normalized), 'used_rows': len(history), 'independent_dates': len({r['date'] for r in history}), 'cutoff': cutoff, 'window_start': start, 'excluded_same_day_or_future': sum((r['date'] >= cutoff for r in normalized))})
     required = ('notice_verified', 'qualification_verified', 'correction_verified', 'history_24_months_complete', 'all_pages_complete', 'three_analyses_complete', 'multiple_estimates_verified', 'competition_verified')
     missing = [key for key in required if coverage.get(key) is not True]
+    data_required = tuple((key for key in required if key != 'qualification_verified'))
+    data_missing = [key for key in data_required if coverage.get(key) is not True]
+    eligibility = 'verified' if coverage.get('qualification_verified') is True else 'user_documents_required'
+    identity = {'engine': ENGINE_VERSION, 'notice': {'id': str(notice.get('notice', notice.get('notice_number', notice.get('code', '')))), 'base': str(base), 'floor': str(floor), 'commodity': notice['commodity'], 'variation': str(variation), 'cutoff': cutoff}, 'rows': [{key: str(row[key]) if isinstance(row[key], D) else row[key] for key in ('notice', 'date', 'commodity', 'base', 'planned', 'floor', 'winning')} for row in history], 'cost_floor': None if min_cost is None else str(min_cost)}
+    fingerprint = hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
     warnings = []
     if missing:
         warnings.append('잠정 후보·필수 확인 미완료: ' + ', '.join(missing))
@@ -203,7 +212,142 @@ def report_analysis(notice, rows, cost_floor=None):
         warnings.append('원가·배송·손질·폐기·세금 미확인: 수익성 미검증')
     elif not main['cost_acceptable']:
         warnings.append('주후보가 사용자 최저수용가 미만입니다. 자동 가산하지 않으며 제출 후보로 부적합합니다')
-    return {'main_candidate': main, 'alternatives': [c for c in candidates if c is not main], 'candidates': candidates, 'coverage': coverage, 'validation': validation, 'confidence': validation['confidence'], 'warnings': warnings, 'status': 'verified' if not missing else 'provisional', 'profitability': 'unverified' if min_cost is None else 'cost_floor_pass' if main['cost_acceptable'] else 'cost_floor_fail', 'statistics': {'all_same_floor': stats([r for r in history if r['floor'] == floor]), 'item_same_floor': stats([r for r in history if r['floor'] == floor and r['commodity'] == notice['commodity']])}, 'reason': '별도 평가 우위 확인' if validation['verified_superiority'] else '우위 불명확: 사전 정의 단순 기준', 'counterargument': '실제 예가율이 미달 경계를 넘으면 무효이며 높은 후보는 기록상 1순위보다 비쌀 수 있습니다', 'interpretation': COUNTERFACTUAL}
+    return {'main_candidate': main, 'alternatives': [c for c in candidates if c is not main], 'candidates': candidates, 'coverage': coverage, 'validation': validation, 'confidence': validation['confidence'], 'warnings': warnings, 'status': 'verified' if not missing else 'provisional', 'data_status': 'verified' if not data_missing else 'incomplete', 'eligibility_status': eligibility, 'replay': {'engine_version': ENGINE_VERSION, 'input_sha256': fingerprint, 'guarantee': '같은 버전·공고 조건·원자료·기준일·최저수용가의 직접 분석과 앱 계산은 동일', 'limitation': '과거 수동 판단의 고정 사정률 또는 다른 원자료와 결과 일치를 보장하지 않음'}, 'profitability': 'unverified' if min_cost is None else 'cost_floor_pass' if main['cost_acceptable'] else 'cost_floor_fail', 'statistics': {'all_same_floor': stats([r for r in history if r['floor'] == floor]), 'item_same_floor': stats([r for r in history if r['floor'] == floor and r['commodity'] == notice['commodity']])}, 'reason': '별도 평가 우위 확인' if validation['verified_superiority'] else '우위 불명확: 사전 정의 단순 기준', 'counterargument': '실제 예가율이 미달 경계를 넘으면 무효이며 높은 후보는 기록상 1순위보다 비쌀 수 있습니다', 'interpretation': COUNTERFACTUAL}
+import re
+from urllib.parse import urljoin, urlparse, parse_qs
+from bs4 import BeautifulSoup
+
+def ne_num(value):
+    match = re.fullmatch('\\s*([+-]?\\d[\\d,]*(?:\\.\\d+)?)\\s*%?\\s*', str(value or ''))
+    return float(match[1].replace(',', '')) if match else None
+
+def notice_source_evidence(html, notice):
+    soup = BeautifulSoup(html, 'html.parser')
+    source = soup.select_one('#content-box')
+    fields = {}
+    if source:
+        for cell in source.select('td.item'):
+            value = cell.find_next_sibling('td')
+            if value:
+                fields[re.sub('\\s+', '', cell.get_text(' ', strip=True))] = value.get_text(' ', strip=True)
+    current = str(notice.get('notice_number') or '')
+    mirrored = fields.get('공고번호-차수', '')
+    base = ne_num(fields.get('기초가격(입찰시작가격)'))
+    award = fields.get('낙찰방식', '')
+    floor_match = re.search('예정가격의\\s*\\[?\\s*(\\d+(?:\\.\\d+)?)\\s*\\]?\\s*%', award)
+    floor = float(floor_match[1]) if floor_match else None
+    matching = bool(current and mirrored == current and (base == notice.get('base')) and (floor == notice.get('floor')))
+    required = ('제한조건', '자격제한', '납품기간/시간', '납품장소', '낙찰방식')
+    complete = matching and all((fields.get(key) for key in required))
+    history = soup.select_one('#history_popover_content')
+    correction_ids = sorted(set(re.findall('E\\d{6}-\\d+-\\d+', history.get_text(' ', strip=True)))) if history else []
+    correction_complete = bool(history is not None and current.endswith('-0') and matching and (not correction_ids))
+    correction_links = []
+    if history:
+        for anchor in history.select('a[href]'):
+            address = urljoin(notice.get('source_url', ''), anchor['href'])
+            if urlparse(address).hostname in {'www.bidq.co.kr', 'bidq.co.kr'}:
+                correction_links.append(address)
+    linked_ids = []
+    if history:
+        for anchor in history.select('a[href]'):
+            address = urljoin(notice.get('source_url', ''), anchor['href'])
+            ids = re.findall('E\\d{6}-\\d+-\\d+', anchor.get_text(' ', strip=True))
+            if urlparse(address).hostname in {'www.bidq.co.kr', 'bidq.co.kr'} and '/bids/detail/' in urlparse(address).path and parse_qs(urlparse(address).query).get('bidid'):
+                linked_ids.extend(ids)
+    family, _, revision_text = current.rpartition('-')
+    if revision_text.isdigit() and int(revision_text) > 0 and matching:
+        chain = {family + '-' + str(i) for i in range(int(revision_text) + 1)}
+        same_family = {item for item in correction_ids if item.rpartition('-')[0] == family}
+        correction_complete = same_family == chain and set(linked_ids) >= chain
+    return {'source_url': notice.get('source_url'), 'notice_number': current, 'mirror_notice_number': mirrored, 'mirrored_fields': fields, 'notice_source_complete': complete, 'conditions_source_complete': complete, 'qualification_source_complete': complete, 'qualification_verified': False, 'business_eligibility': 'unknown', 'eligibility_reason': '공고의 참가조건은 수집했으나 업체 인증·소재지·수의계약 자격은 증빙 미확인', 'correction_verified': correction_complete, 'correction_notice_numbers': correction_ids, 'correction_links': correction_links, 'attachments_external_not_fetched': [a.get_text(' ', strip=True) for a in source.select('a[href]')] if source else [], 'external_original_verified': False, 'correction_reason': '비드큐 게시 정정 내역 확인' if correction_complete else '정정 공고 연결 및 최신 차수 확인 필요'}
+
+def ne_competitor_page(html):
+    soup = BeautifulSoup(html, 'html.parser')
+    rows = []
+    for table in soup.select('table'):
+        trs = table.select('tr')
+        if not trs:
+            continue
+        headers = [re.sub('\\s+', '', c.get_text(' ', strip=True)) for c in trs[0].find_all(['th', 'td'])]
+        if not {'등록번호', '업체명', '투찰금액'} <= set(headers):
+            continue
+        for tr in trs[1:]:
+            cells = tr.find_all('td', recursive=False)
+            if len(cells) != len(headers):
+                continue
+            fields = dict(zip(headers, [c.get_text(' ', strip=True) for c in cells]))
+            registration = re.sub('\\D', '', fields['등록번호'])
+            amount = ne_num(fields['투찰금액'])
+            if len(registration) != 10 or amount is None:
+                raise ValueError('업체 등록번호 또는 투찰금액 원자료 미확인')
+            reported = fields.get('업체별사정율(%)', '')
+            rate_match = re.match('([+-]?\\d+(?:\\.\\d+)?)', reported)
+            rows.append({'company': fields['업체명'], 'business_registration_number': registration, 'amount': amount, 'rank': ne_num(fields.get('순위')), 'status': fields.get('비고'), 'raw_fields': fields, 'rate_planned_denominator': ne_num(fields.get('투찰율(%)')), 'rate_base_denominator': ne_num(fields.get('기초대비(%)')), 'reported_bid_rate': float(rate_match[1]) if rate_match else None})
+    pages = set()
+    active = None
+    for a in soup.select('.pagination a'):
+        match = re.search('movePage\\((\\d+)\\)', a.get('onclick', ''))
+        if match:
+            pages.add(int(match[1]))
+        if 'active' in (a.parent.get('class') or []) and a.get_text(strip=True).isdigit():
+            active = int(a.get_text(strip=True))
+    return (rows, pages, active)
+
+def collect_competitor_evidence(client, html, source_url, expected_count=None, max_pages=200):
+    """Follow exact protocol published inline by BidQ detail/suc.
+    GET relative comlist with resetSuccomParams; page links expose movePage(n).
+    Count, unique registration, page sequence and empty end must reconcile.
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    script = '\n'.join((s.get_text() for s in soup.select('script:not([src])')))
+    protocol = re.search('\\$\\.get\\(\\s*[\'\\"]comlist[\'\\"]\\s*,\\s*succom_params', script)
+    bidid_match = re.search('[\'\\"]bidid[\'\\"]\\s*:\\s*[\'\\"]([^\'\\"]+)[\'\\"]', script)
+    bidtype_match = re.search('[\'\\"]bidtype[\'\\"]\\s*:\\s*[\'\\"]([^\'\\"]+)[\'\\"]', script)
+    query_bidid = parse_qs(urlparse(source_url).query).get('bidid', [None])[0]
+    count_match = re.search('참여업체수\\s*[:：]\\s*([\\d,]+)', soup.get_text(' ', strip=True))
+    reported_count = int(count_match[1].replace(',', '')) if count_match else expected_count
+    empty = {'rows': [], 'collected': 0, 'expected': reported_count, 'status': 'missing', 'complete': False, 'source_url': source_url, 'reason': '참여업체 Ajax 프로토콜 또는 총건수 미확인'}
+    if not protocol or not bidid_match or (not bidtype_match) or (bidid_match[1] != query_bidid) or (reported_count is None):
+        return empty
+    if expected_count is not None and int(expected_count) != int(reported_count):
+        return {**empty, 'reason': '참여업체 총건수 원자료 상충'}
+    endpoint = urljoin(source_url, 'comlist')
+    params = {'bidid': query_bidid, 'bidtype': bidtype_match[1], 'search_type': '', 'search_word': '', 'hahan': '', 'sort': 'rank2', 'page': 1}
+    rows, seen, pending, visited = ([], set(), {1}, [])
+    complete = True
+    reason = ''
+    while pending:
+        page = min(pending)
+        pending.remove(page)
+        if page in visited or len(visited) >= max_pages:
+            complete, reason = (False, '업체 페이지 안전 상한 도달')
+            break
+        params['page'] = page
+        response = client._request('GET', endpoint, params=dict(params))
+        parsed, advertised, active = ne_competitor_page(response.text)
+        visited.append(page)
+        if active is not None and active != page:
+            complete, reason = (False, '요청 업체 페이지와 응답 페이지 불일치')
+            break
+        for row in parsed:
+            identity = row['business_registration_number']
+            if identity in seen:
+                complete, reason = (False, '업체 중복 또는 페이지 반복 응답')
+                break
+            seen.add(identity)
+            rows.append(row)
+        if not complete:
+            break
+        pending.update(advertised - set(visited))
+        if len(rows) > int(reported_count):
+            complete, reason = (False, '업체 총건수 초과')
+            break
+        if not parsed and len(rows) != int(reported_count):
+            complete, reason = (False, '업체 페이지 조기 종료')
+            break
+    complete = complete and len(rows) == int(reported_count) and (visited == list(range(1, len(visited) + 1)))
+    return {'rows': rows, 'collected': len(rows), 'expected': reported_count, 'status': 'complete' if complete else 'partial' if rows else 'missing', 'complete': complete, 'source_url': source_url, 'endpoint': endpoint, 'pages': visited, 'reason': '등록번호 중복 없이 총건수 및 게시된 전체 페이지 일치' if complete else reason or '업체 총건수/페이지 미일치'}
 import calendar
 import re
 from datetime import date, datetime, timezone, timedelta
@@ -254,7 +398,7 @@ def choose(mapping, *keys):
     return None
 
 def school_token(name):
-    match = re.search('([가-힣A-Za-z0-9]+(?:초등학교|중학교|고등학교))', name or '')
+    match = re.search('([가-힣A-Za-z0-9]+(?:초등학교|중학교|고등학교|유치원))', name or '')
     return match[1] if match else None
 
 def commodity_classification(explicit=None, title=None):
@@ -300,7 +444,7 @@ def related_school_names(current, candidate):
         return False
 
     def district(name):
-        match = re.search('(?:^|\\s)([가-힣]+[구군])(?:\\s|$)', name)
+        match = re.search('(?:광역시|특별시|특별자치시|도)\\s*([가-힣]+?[구군])', name)
         return match[1] if match else None
     da, db = (district(current), district(candidate))
     if da and da == db:
@@ -496,6 +640,7 @@ class BidQClient:
             return ([name], False)
         response = self._request('GET', '/bidq/bids/list', params={'bidtype': 'pur', 'bid_suc': 'suc', 'searchWord': token, 'word_type': 'all_Search', 'subWord': token})
         names, evidence, excluded = ([name], [], [])
+        reported_totals, listing_ids = (set(), set())
         queue, visited, detail_seen = ([(None, response.text)], set(), set())
         unmapped_more = False
         while queue:
@@ -508,6 +653,10 @@ class BidQClient:
                 visited.add(page_url)
                 html = self._request('GET', page_url).text
             soup = BeautifulSoup(html, 'html.parser')
+            for match in re.finditer('총\\s*([\\d,]+)\\s*건', soup.get_text(' ', strip=True)):
+                reported_totals.add(int(match[1].replace(',', '')))
+            for url in self._detail_links(html):
+                listing_ids.add(parse_qs(urlparse(url).query).get('bidid', [url])[0])
             for anchor in soup.select('.pagination a[href], a[rel="next"], a[rel="last"]'):
                 linked = urljoin(BASE, anchor['href'])
                 parsed = urlparse(linked)
@@ -541,11 +690,16 @@ class BidQClient:
                 else:
                     record['reason'] = '학교명 또는 행정구역 동일성 불일치'
                     excluded.append(record)
-        self._alias_discovery = {'school': token, 'names': names, 'status': 'partial', 'search_pages': len(visited) + 1, 'detail_count': len(detail_seen), 'candidate_evidence': evidence, 'excluded': excluded, 'unmapped_pagination': unmapped_more, 'identity_verified': False, 'reason': '구매검색 링크 확인 범위만 수집; 사이트 총건수/최종페이지 및 기관 연속성 원문 미확인'}
+        search_complete = len(reported_totals) == 1 and len(listing_ids) == next(iter(reported_totals)) and (not unmapped_more)
+        district = re.search('(?:^|\\s)([가-힣]+구)(?:\\s|$)', name)
+        transition_expected = bool(district and district[1] in {'서해구', '검단구', '제물포구', '영종구'})
+        legacy_found = any((record['name'] != name for record in evidence))
+        identity_verified = search_complete and bool(evidence) and (not transition_expected or legacy_found)
+        self._alias_discovery = {'school': token, 'names': names, 'status': 'complete' if identity_verified else 'partial', 'search_pages': len(visited) + 1, 'detail_count': len(detail_seen), 'candidate_evidence': evidence, 'excluded': excluded, 'unmapped_pagination': unmapped_more, 'identity_verified': identity_verified, 'search_complete': search_complete, 'reported_totals': sorted(reported_totals), 'listed_unique': len(listing_ids), 'legacy_found': legacy_found, 'identity_method': 'exact_school_province_transition_source_details', 'reason': None if identity_verified else '학교 검색 총건수/최종페이지 또는 변경 전 기관 상세 원문 미확인'}
         if '인천광역시' in name:
             district = re.search('(?:^|\\s)([가-힣]+구)(?:\\s|$)', name)
             self._alias_discovery['administrative_search_hints'] = list(DISTRICT_HINTS.get(district[1], ())) if district else []
-        return (names, False)
+        return (names, identity_verified)
 
     def _params(self, names, start, end, graph_type='orgi'):
         params = {'org_codes': [], 'org_names': names, 'bidtype': 'pur', 'itemcode': '', 'amount1': '', 'amount2': '', 'amount_column': 'presum', 'danga_option': '', 'danga_option2': '', 'danga_org': 'none', 'danga_year': 'clear', 'date1': start.isoformat(), 'date2': end.isoformat(), 'graphType': graph_type, 'innum1': '', 'innum2': '', 'localcode': '', 'location': '', 'point': '100'}
@@ -562,16 +716,29 @@ class BidQClient:
         if reported is None or reported < 0 or reported != int(reported):
             raise CollectionError('그래프 API 총건수 미확인')
         total, rows, pages = (int(reported), [], 0)
+        seen_ids = set()
         for page in range(1, 501):
             payload = {**params, 'page': page, 'pageSize': 20}
             data = self._request('POST', '/bidq/analysis/common-api/opened-data', json=payload, headers=headers).json()
             if not isinstance(data, dict) or not isinstance(data.get('data'), list):
                 raise CollectionError('발주처 분석 API 응답 구조 미확인')
             batch = data['data']
+            for raw in batch:
+                if not isinstance(raw, dict):
+                    raise CollectionError('개찰행 응답 구조 미확인')
+                identity = choose(raw, 'notinum', 'notice', 'notice_number', 'bidid')
+                if not identity:
+                    raise CollectionError('개찰행 고유번호 누락: 전체 페이지 확인 불가')
+                if identity in seen_ids:
+                    raise CollectionError('개찰 페이지 중복 공고: 전체 페이지 확인 불가')
+                seen_ids.add(identity)
+                day = iso_day(choose(raw, 'constdt', 'date', '개찰일'))
+                if day and (not start.isoformat() <= day <= end.isoformat()):
+                    raise CollectionError('개찰행이 요청 조회기간 밖에 있습니다.')
             rows.extend(batch)
             pages = page
             if len(rows) == total:
-                return (rows, {'status': 'complete', 'total': total, 'collected': len(rows), 'pages': pages, 'start': start.isoformat(), 'end': end.isoformat(), 'names': names, 'graph_type': graph_type, 'graph': graph, 'org_count': data.get('org_count')})
+                return (rows, {'status': 'complete', 'total': total, 'collected': len(rows), 'pages': pages, 'start': start.isoformat(), 'end': end.isoformat(), 'names': names, 'graph_type': graph_type, 'graph': graph, 'org_count': data.get('org_count'), 'unique_rows_verified': len(seen_ids) == total, 'last_page_verified': True})
             if not batch or len(rows) > total:
                 raise CollectionError('발주처 마지막 페이지/총건수 불일치')
         raise CollectionError('발주처 500페이지 안전 한도 초과: 일부 자료를 완료로 반환하지 않습니다.')
@@ -583,6 +750,14 @@ class BidQClient:
         notice = self.find_notice(notice_number.strip())
         if not notice['name']:
             raise CollectionError('발주기관 미확인')
+        self.stage = '공고 원문·정정 내역 확인'
+        notice_html = self._request('GET', notice['source_url']).text
+        source_evidence = notice_source_evidence(notice_html, notice)
+        notice['conditions_evidence'] = source_evidence
+        if source_evidence['qualification_source_complete']:
+            notice['qualification'] = source_evidence['mirrored_fields']['자격제한']
+        if source_evidence['correction_verified']:
+            notice['correction'] = '비드큐 게시 정정 내역 확인'
         self.stage = '학교명·변경 전후 발주처 연결'
         names, alias_verified = self.discover_names(notice['name'])
         for name in legacy_names or []:
@@ -615,6 +790,7 @@ class BidQClient:
             frequency_rows.extend(found)
         issues = []
         rows, seen, competition = ([], set(), [])
+        by_notice = {}
         for raw in raw_rows:
             row = canonical_row(raw)
             if row['bidid'] and any((row.get(key) is None for key in ('notice', 'base', 'planned', 'floor'))):
@@ -640,9 +816,25 @@ class BidQClient:
                 rows.append(row)
                 continue
             if identity in seen:
+                previous = by_notice[identity]
+                if any((previous.get(key) is not None and row.get(key) is not None and (previous[key] != row[key]) for key in ('base', 'planned', 'floor', 'winning'))):
+                    raise CollectionError('기관별 중복 공고의 금액·하한율 상충: ' + str(identity))
                 continue
             seen.add(identity)
+            by_notice[identity] = row
             rows.append(row)
+        comparable = sorted([row for row in rows if row.get('commodity') == notice.get('commodity') and row.get('floor') == notice.get('floor') and row.get('source_url')], key=lambda row: (row.get('date') or '', row['notice_number'] or ''), reverse=True)[:3]
+        competition = []
+        for row in comparable:
+            self.stage = '최근 동일 품목 경쟁업체 전체 페이지 확인'
+            competitor_html = self._request('GET', row['source_url']).text
+            competitors = collect_competitor_evidence(self, competitor_html, row['source_url'], row.get('participants'))
+            planned = row.get('planned')
+            threshold = planned * row['floor'] / 100 if planned else None
+            valid = sorted([entry['amount'] for entry in competitors['rows'] if threshold is not None and entry['amount'] >= threshold])
+            competitors['comparison'] = {'planned': planned, 'floor': row['floor'], 'threshold': threshold, 'below_floor_count': sum((entry['amount'] < threshold for entry in competitors['rows'])) if threshold else None, 'valid_count': len(valid), 'first_floor_gap': valid[0] - threshold if valid else None, 'first_second_gap': valid[1] - valid[0] if len(valid) > 1 else None, 'owned_rows': [entry for entry in competitors['rows'] if entry['business_registration_number'] == '3418703699']}
+            competition.append({'notice_number': row['notice_number'], **competitors})
+        competition_complete = bool(comparable) and all((item['complete'] for item in competition))
         required = ('base', 'floor', 'variation', 'deadline', 'correction', 'qualification')
         issues.extend(('현재 공고 ' + key + ' 원문 미확인' for key in required if notice.get(key) is None))
         if not alias_verified:
@@ -651,20 +843,21 @@ class BidQClient:
             issues.append('일부 예정가격/기초금액 미확인: success_pct를 예가율로 사용하지 않음')
         missing = {'status': 'missing', 'reason': '실제 화면/API 매핑 및 마지막 페이지를 확인하지 못함'}
         multi_records = [{'notice': choose(raw, 'notinum', 'notice', 'notice_number'), **multiple_estimates(raw)} for raw in raw_rows]
-        multi_complete = bool(multi_records) and all((record['verified'] for record in multi_records))
+        multi_complete = len(multi_records) == org['total'] and all((record['verified'] for record in multi_records))
         org_ids = {choose(raw, 'notinum', 'notice', 'notice_number', 'bidid') for raw in raw_rows}
         freq_ids = {choose(raw, 'notinum', 'notice', 'notice_number', 'bidid') for raw in frequency_rows}
         if org_ids != freq_ids:
             raise CollectionError('발주처/사정률 분석 공고 집합 불일치')
         freq_scope = {'status': 'complete', 'parts': frequency_parts, 'collected': len(frequency_rows), 'total': sum((part.get('total', 0) for part in frequency_parts))}
-        coverage = {'org': org, 'freq': freq_scope, 'multi': {'status': 'complete' if multi_complete else 'partial', 'records': multi_records, 'total': org['total'], 'collected': len(multi_records), 'source': 'opened-data.multispares_pct; type is a frontend store branch only'}, 'competition': {'status': 'partial' if competition else 'missing', 'notices': competition, 'reason': '최근 육류 업체목록 전체 페이지 API 매핑 미확인'}, 'aliases': {**getattr(self, '_alias_discovery', {}), 'names': names, 'counts': alias_counts, 'identity_verified': alias_verified}, 'captured_at': datetime.now().isoformat(timespec='seconds')}
-        coverage.update({'notice_verified': all((notice.get(key) is not None for key in ('notice', 'name', 'base', 'floor', 'variation', 'deadline'))), 'qualification_verified': False, 'correction_verified': False, 'history_24_months_complete': False, 'all_pages_complete': False, 'three_analyses_complete': False, 'multiple_estimates_verified': False, 'competition_verified': False})
+        coverage = {'org': org, 'freq': freq_scope, 'multi': {'status': 'complete' if multi_complete else 'partial', 'records': multi_records, 'total': org['total'], 'collected': len(multi_records), 'source': 'opened-data.multispares_pct; type is a frontend store branch only'}, 'competition': {'status': 'complete' if competition_complete else 'partial' if competition else 'missing', 'notices': competition, 'sample_rule': '최근 동일 품목·하한율 최대 3개 공고의 전체 참여업체', 'expected_notices': len(comparable), 'collected_notices': len(competition), 'reason': None if competition_complete else '비교 공고 또는 업체 총건수·최종페이지 미확인'}, 'notice_source': source_evidence, 'aliases': {**getattr(self, '_alias_discovery', {}), 'names': names, 'counts': alias_counts, 'identity_verified': alias_verified}, 'captured_at': datetime.now(timezone(timedelta(hours=9))).isoformat(timespec='seconds')}
+        coverage.update({'notice_verified': all((notice.get(key) is not None for key in ('notice', 'name', 'base', 'floor', 'variation', 'deadline'))), 'qualification_verified': False, 'qualification_source_complete': source_evidence['qualification_source_complete'], 'notice_source_complete': source_evidence['notice_source_complete'], 'correction_verified': source_evidence['correction_verified'], 'history_24_months_complete': months == 24 and alias_verified and all((part.get('status') == 'complete' and part.get('unique_rows_verified') for part in parts + frequency_parts)), 'all_pages_complete': alias_verified and all((part.get('last_page_verified') for part in parts + frequency_parts)), 'three_analyses_complete': False, 'multiple_estimates_verified': False, 'competition_verified': competition_complete})
         coverage['multiple_estimates_verified'] = multi_complete
-        coverage['three_analyses_complete'] = multi_complete
+        coverage['three_analyses_complete'] = multi_complete and all((part.get('status') == 'complete' for part in parts + frequency_parts))
         notice['coverage'] = coverage
         if not multi_complete:
             issues.append('복수예가15개/선택4개/금액 검산 미완료')
-        issues.append('최근 육류 경쟁업체 전체 수집 미완료')
+        if not competition_complete:
+            issues.append('최근 동일 품목 경쟁업체 전체 수집 미완료')
         return {'notice': notice, 'school': school_token(notice['name']), 'aliases': coverage['aliases'], 'rows': rows, 'coverage': coverage, 'issues': list(dict.fromkeys(issues)), 'verified': False}
 import json
 import re
@@ -717,7 +910,56 @@ def build_review_payload(notice, report):
 def _result(status, model, reason, **extra):
     return {'status': status, 'selected_method': None, 'reason': reason, 'counterargument': '', 'category': 'candidate_review', 'limits': ['AI 제안은 코드 주후보·원자료 확인을 대체하지 않습니다'], 'source': {'provider': 'Google Gemini', 'model': model}, **extra}
 
-def review_candidates(api_key, model='gemini-2.5-flash', notice=None, report=None, session=None):
+def _http_reason(code):
+    return {400: 'Gemini 요청 설정 오류. 선택 모델의 지원 형식을 확인하세요', 401: 'Gemini API 인증 실패. API 키를 확인하세요', 403: 'Gemini API 사용 권한이 없습니다. 키·프로젝트 권한을 확인하세요', 404: '이 API 키에서 선택 모델을 찾을 수 없습니다. 모델 목록을 조회하고 다른 모델을 선택하세요', 429: 'Gemini API 요청량 또는 사용 한도를 초과했습니다. 사용량·한도를 확인하세요', 402: 'Gemini API 결제 확인이 필요합니다. 결제 계정·잔액을 확인하세요'}.get(code, 'Gemini API 호출 실패. 접속 상태와 서비스 상태를 확인하세요')
+
+def list_generation_models(api_key, session=None):
+    """Official models.list; key is header-only and remote text never echoed."""
+    source = {'provider': 'Google Gemini', 'endpoint': 'v1beta/models'}
+    if not isinstance(api_key, str) or not api_key.strip():
+        return {'status': 'error', 'models': [], 'reason': 'Gemini API 키가 설정되지 않았습니다', 'source': source}
+    try:
+        if session is None:
+            import requests
+            session = requests
+        names, tokens, page_token = (set(), set(), None)
+        for _ in range(20):
+            params = {'pageSize': 1000}
+            if page_token:
+                params['pageToken'] = page_token
+            response = session.get('https://generativelanguage.googleapis.com/v1beta/models', headers={'x-goog-api-key': api_key.strip()}, params=params, timeout=(10, 20))
+            if response.status_code != 200:
+                code = response.status_code if isinstance(response.status_code, int) else 'unknown'
+                return {'status': 'error', 'models': [], 'http_status': code, 'reason': _http_reason(code), 'source': source}
+            payload = response.json()
+            models = payload.get('models', [])
+            if not isinstance(models, list):
+                raise ValueError('invalid models response')
+            for entry in models:
+                if not isinstance(entry, dict):
+                    raise ValueError('invalid model entry')
+                name = entry.get('name', '')
+                if isinstance(name, str) and re.fullmatch('models/gemini-[a-zA-Z0-9.-]{1,90}', name) and ('generateContent' in entry.get('supportedGenerationMethods', [])) and (not re.search('image|audio|tts|live|embed|robotics|computer-use|video', name, re.I)):
+                    names.add(name.removeprefix('models/'))
+            next_token = payload.get('nextPageToken')
+            if not next_token:
+                return {'status': 'ok', 'models': sorted(names), 'reason': '이 API 키에서 조회된 텍스트 생성 모델입니다. 실제 호출 한도는 별도 확인합니다', 'source': source}
+            if not isinstance(next_token, str) or len(next_token) > 2048 or next_token in tokens or (api_key.strip() in next_token):
+                raise ValueError('invalid pagination token')
+            tokens.add(next_token)
+            page_token = next_token
+        raise ValueError('pagination limit')
+    except Exception:
+        return {'status': 'error', 'models': [], 'reason': 'Gemini 모델 목록 조회 실패. 접속과 API 키를 확인하세요', 'source': source}
+
+def _usage_metadata(envelope):
+    metadata = envelope.get('usageMetadata')
+    if not isinstance(metadata, dict):
+        return {}
+    keys = ('promptTokenCount', 'candidatesTokenCount', 'totalTokenCount', 'thoughtsTokenCount', 'cachedContentTokenCount')
+    return {key: metadata[key] for key in keys if isinstance(metadata.get(key), int) and (not isinstance(metadata[key], bool)) and (metadata[key] >= 0)}
+
+def review_candidates(api_key, model='gemini-3.6-flash', notice=None, report=None, session=None):
     """Return bounded review; failure messages never contain response/exception text."""
     if not isinstance(model, str) or not re.fullmatch('gemini-[a-zA-Z0-9.-]{1,90}', model):
         return _result('rejected', 'invalid', '모델 이름 형식이 올바르지 않습니다')
@@ -738,7 +980,7 @@ def review_candidates(api_key, model='gemini-2.5-flash', notice=None, report=Non
         response = session.post(f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent', headers={'x-goog-api-key': api_key.strip(), 'Content-Type': 'application/json'}, json=body, timeout=(10, 45))
         if response.status_code != 200:
             code = response.status_code if isinstance(response.status_code, int) else 'unknown'
-            return _result('error', model, f'Gemini API 호출 실패 (HTTP {code}). 키·권한·모델·한도를 확인하세요')
+            return _result('error', model, _http_reason(code), http_status=code)
         envelope = response.json()
         candidate = envelope['candidates'][0]
         if candidate.get('finishReason') != 'STOP':
@@ -765,7 +1007,7 @@ def review_candidates(api_key, model='gemini-2.5-flash', notice=None, report=Non
     version = envelope.get('modelVersion', model)
     if not isinstance(version, str) or not re.fullmatch('gemini-[a-zA-Z0-9.-]{1,90}', version):
         version = model
-    result.update({'status': 'provisional' if incomplete else 'suggestion', 'source': {'provider': 'Google Gemini', 'model': model, 'model_version': version}})
+    result.update({'status': 'provisional' if incomplete else 'suggestion', 'source': {'provider': 'Google Gemini', 'model': model, 'model_version': version}, 'usage': _usage_metadata(envelope)})
     result['limits'].append('AI 제안은 코드 주후보를 자동 변경하지 않습니다')
     if incomplete:
         result['limits'].append('필수 출처 확인 미완료: 잠정 검토')
@@ -849,11 +1091,20 @@ def remember(bundle, report):
 def display(bundle, report, prefix):
     notice = bundle['notice']
     main = report['main_candidate']
-    st.dataframe([{'학교': notice.get('name', ''), '입찰가': f"{main['price']:,}원", '마감': notice.get('deadline', '미확인'), '상태': '검증 완료 비교 후보' if report['status'] == 'verified' else '잠정·필수 확인 미완료'}], hide_index=True, width='stretch')
+    state_label = '자료 수집·검산 완료 · 참가자격 확인 필요' if report.get('data_status') == 'verified' else '잠정·필수 자료 확인 미완료'
+    if report['status'] == 'verified':
+        state_label = '자료·계산 검증 완료'
+    st.dataframe([{'학교': notice.get('name', ''), '입찰가': f"{main['price']:,}원", '마감': notice.get('deadline', '미확인'), '상태': state_label}], hide_index=True, width='stretch')
     st.caption(f"가정 사정률 {main['rate']:.6f}% / 금액을 역산한 사정률 {main['boundary']:.6f}% / 하한율 {notice['floor']}%")
     st.caption(f"실제 예가율 {main['boundary']:.6f}% 초과 시 산술상 미달. 자릿수만 늘린다고 동가를 피하거나 예측력이 높아지는 것은 아닙니다.")
+    coverage_labels = {'qualification_verified': '업체 참가자격 증빙', 'correction_verified': '최신 정정 내역', 'history_24_months_complete': '변경 전후 24개월 전체 자료', 'all_pages_complete': '마지막 페이지', 'three_analyses_complete': '발주처·사정률·복수예가', 'multiple_estimates_verified': '복수예가 검산', 'competition_verified': '경쟁업체 전체 목록', 'notice_verified': '공고 조건'}
     for warning in dict.fromkeys(report['warnings'] + bundle.get('issues', [])):
+        for field, label in coverage_labels.items():
+            warning = warning.replace(field, label)
         st.warning(warning)
+    ai = bundle.get('gemini_review')
+    if ai and ai.get('status') in ('error', 'rejected'):
+        st.warning('Gemini 근거 검토 미완료: ' + ai.get('reason', '응답 확인 실패') + ' · 추가 설정에서 모델을 바꾼 뒤 AI 검토만 다시 실행할 수 있습니다.')
     with st.expander('근거·대안·수집 범위·검증'):
         st.write(report['reason'])
         st.write(report['counterargument'])
@@ -868,13 +1119,17 @@ def display(bundle, report, prefix):
                 pass
         st.write('인근 세밀 후보의 민감도 비교 — 동가 회피나 낙찰 우위를 검증한 가격이 아닙니다.')
         st.dataframe(nearby, hide_index=True, width='stretch')
-        st.json(clean({'statistics': report['statistics'], 'coverage': report['coverage'], 'validation': report['validation']}))
+        st.json(clean({'statistics': report['statistics'], 'coverage': report['coverage'], 'validation': report['validation'], 'replay': report.get('replay')}))
         if bundle.get('aliases'):
             st.write('학교명으로 연결한 발주처와 수집 건수')
             st.json(clean(bundle['aliases']))
         if bundle.get('gemini_review'):
             st.write('Gemini 후보 근거 검토 — 코드의 검증 기준과 금액을 임의 변경하지 않습니다.')
             st.json(clean(bundle['gemini_review']))
+        if notice.get('conditions_evidence'):
+            st.write('비드큐에 게시된 공고 원문·정정·참가조건')
+            st.json(clean(notice['conditions_evidence']))
+            st.caption('업체의 실제 HACCP·등록·소재지 증빙과 외부 첨부문서는 별도 확인이 필요합니다.')
     snapshot = {**bundle, 'report': report, 'captured_at': datetime.now(KST).isoformat()}
     st.download_button('원자료·검산 JSON', packed(snapshot), f'{prefix}_분석.json', 'application/json', key=f'{prefix}_download')
     st.caption('추천내역은 이 세션에 자동 기록됩니다. 영구 저장소 연결 전에는 기록 JSON을 보관하세요.')
@@ -907,7 +1162,28 @@ with st.sidebar:
             if userid and hmac.compare_digest(userid, secret('BIDQ_ID')):
                 api_key = api_key or secret('GEMINI_API_KEY')
     with st.expander('추가 설정'):
-        model = st.text_input('Gemini 모델', value=secret('GEMINI_MODEL') or 'gemini-2.5-flash')
+        default_model = secret('GEMINI_MODEL') or 'gemini-3.6-flash'
+        if st.button('현재 모델 목록 새로고침'):
+            available = list_generation_models(api_key)
+            if available.get('status') == 'ok':
+                st.session_state['generation_models'] = available['models']
+                st.success('API가 반환한 모델 목록을 확인했습니다. 호출 가능 여부는 실제 검토 시 확인합니다.')
+            else:
+                st.warning(available.get('reason', '모델 목록 조회 실패'))
+        options = list(dict.fromkeys([default_model, *st.session_state.get('generation_models', []), 'gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite']))
+        selection = st.selectbox('Gemini 모델 선택', options + ['직접 입력'], key='selected_gemini_model')
+        model = st.text_input('Gemini 모델 직접 입력', value=default_model, key='custom_gemini_model') if selection == '직접 입력' else selection
+        st.caption('선택한 모델을 사용하며 다른 모델로 몰래 변경하지 않습니다. 모델별 API 사용료는 다를 수 있습니다.')
+        if st.button('수집 자료로 AI 검토만 다시 실행'):
+            existing = st.session_state.get('results', [])
+            if not api_key:
+                st.warning('Gemini API 키가 필요합니다.')
+            elif not existing:
+                st.info('먼저 비드큐 자료 수집을 실행하세요.')
+            else:
+                for collected, current_report in existing:
+                    collected['gemini_review'] = review_candidates(api_key, model, collected['notice'], current_report)
+                st.success('AI 검토를 다시 실행했습니다. 아래 결과에서 성공 여부를 확인하세요. 코드로 계산한 금액은 유지합니다.')
     st.caption('금액은 코드가 검산하고 Gemini는 후보의 근거를 검토합니다. 키·접속정보는 코드·공유 캐시·다운로드에 저장하지 않습니다.')
     minimum = st.number_input('최저 수용 입찰가(원, 미확인 시 0)', min_value=0, value=0, step=1000)
     cost_floor = minimum or None
