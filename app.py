@@ -1104,19 +1104,21 @@ def review_candidates(api_key, model='gemini-3.8-flash', notice=None, report=Non
     if not methods:
         return _result('rejected', model, '검산된 사전 후보가 없습니다')
     schema = {'type': 'OBJECT', 'properties': {'selected_method': {'type': 'STRING', 'enum': sorted(methods | {'abstain'})}, 'reason': {'type': 'STRING'}, 'counterargument': {'type': 'STRING'}, 'category': {'type': 'STRING', 'enum': ['candidate_review']}, 'limits': {'type': 'ARRAY', 'items': {'type': 'STRING'}}, 'evidence_refs': {'type': 'ARRAY', 'items': {'type': 'STRING'}}}, 'required': ['selected_method', 'reason', 'counterargument', 'category', 'limits', 'evidence_refs']}
-    body = {'systemInstruction': {'parts': [{'text': PROMPT}]}, 'contents': [{'role': 'user', 'parts': [{'text': json.dumps(payload, ensure_ascii=False)}]}], 'generationConfig': {'temperature': 0, 'maxOutputTokens': 1024, 'responseMimeType': 'application/json', 'responseSchema': schema}}
+    body = {'systemInstruction': {'parts': [{'text': PROMPT}]}, 'contents': [{'role': 'user', 'parts': [{'text': json.dumps(payload, ensure_ascii=False)}]}], 'generationConfig': {'temperature': 0, 'maxOutputTokens': 4096, 'responseMimeType': 'application/json', 'responseSchema': schema}}
     try:
         if session is None:
             import requests
             session = requests
-        response = session.post(f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent', headers={'x-goog-api-key': api_key.strip(), 'Content-Type': 'application/json'}, json=body, timeout=(10, 45))
+        response = session.post(f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent', headers={'x-goog-api-key': api_key.strip(), 'Content-Type': 'application/json'}, json=body, timeout=(10, 90))
         if response.status_code != 200:
             code = response.status_code if isinstance(response.status_code, int) else 'unknown'
             return _result('error', model, _http_reason(code), http_status=code)
         envelope = response.json()
         candidate = envelope['candidates'][0]
         if candidate.get('finishReason') != 'STOP':
-            return _result('rejected', model, 'Gemini 응답이 정상 완료되지 않았습니다')
+            finish_reason = candidate.get('finishReason')
+            safe_reason = finish_reason if finish_reason in ('MAX_TOKENS', 'SAFETY', 'RECITATION', 'OTHER') else 'UNKNOWN'
+            return _result('rejected', model, 'Gemini 응답이 정상 완료되지 않았습니다', finish_reason=safe_reason, usage=_usage_metadata(envelope))
         text = ''.join((part.get('text', '') for part in candidate['content']['parts'] if not part.get('thought')))
         result = json.loads(text)
     except Exception:
