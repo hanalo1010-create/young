@@ -70,7 +70,7 @@ def normalize_records(rows, variation=3):
         record = dict(row)
         for key in ('notice', 'date', 'commodity', 'base', 'planned', 'floor'):
             if key not in record or record[key] in (None, ''):
-                raise ValueError(f'{key}: 필수 과거자료 누락')
+                raise ValueError(f"{record.get('notice') or record.get('notice_number') or '공고번호 미확인'}: {key} 필수 과거자료 누락")
         record['notice'] = str(record['notice']).strip()
         record['commodity'] = str(record['commodity']).strip()
         record['date'] = _date(record['date'])
@@ -179,9 +179,14 @@ def walk_forward(rows, commodity=None, floor=None):
     return {'selection_checks': checks, 'unmet_checks': [key for key, passed in checks.items() if not passed], 'selected_on_training': chosen, 'selected_method': chosen if superiority else None, 'verified_superiority': superiority, 'confidence': 'limited' if superiority else 'low', 'summaries': summaries, 'evaluations': evaluations, 'training_dates': sorted(train_dates), 'holdout_dates': dates[split:], 'selection_common_notices': sorted(common_ids), 'target_scope': {'commodity': commodity, 'floor': floor, 'records': len(targets), 'independent_dates': len(dates)}, 'interpretation': COUNTERFACTUAL, 'selection_rule': '사전 정의 후보의 학습 MAE로 1개 선택, 별도 평가에서 단순 기준 대비 오차·가격경쟁 개선 확인; 우위 불명확 시 통계 추천 보류; 100%는 비교 기준만 유지'}
 
 def report_analysis(notice, rows, cost_floor=None):
+    allowed = {'육류', '농산물'}
+    if notice.get('commodity') not in allowed:
+        raise ValueError('현재 공고는 축산물·농산물만 분석합니다')
     base, floor = (_money(notice['base'], '기초금액'), _floor(notice['floor']))
     variation = _variation(notice.get('variation', 3))
-    normalized = normalize_records(rows, variation)
+    selected_rows = [row for row in rows if row.get('commodity') in allowed]
+    excluded_rows = [row for row in rows if row.get('commodity') not in allowed]
+    normalized = normalize_records(selected_rows, variation)
     cutoff = _date(notice.get('date', date.today()))
     cutoff_date = date.fromisoformat(cutoff)
     try:
@@ -221,10 +226,10 @@ def report_analysis(notice, rows, cost_floor=None):
         diagnostic_reasons.append('현재 품목·하한율이 모두 같은 자료가 없습니다; 기관 평균은 다른 품목 참고값입니다')
     if not validation['verified_superiority']:
         diagnostic_reasons.append('독립 평가에서 통계 우위 미확인; 100% 자동 추천을 하지 않습니다')
-    diagnostics = {'input_rows': len(rows), 'unique_rows': len(normalized), 'window_rows': len(history), 'same_floor_rows': len(comparable), 'same_item_floor_rows': len(items), 'same_item_independent_dates': len(groups), 'candidate_methods': list(methods), 'training_dates': len(validation['training_dates']), 'holdout_dates': len(validation['holdout_dates']), 'unmet_validation_checks': validation['unmet_checks'], 'reasons': diagnostic_reasons}
+    diagnostics = {'input_rows': len(rows), 'eligible_rows': len(selected_rows), 'excluded_rows': len(excluded_rows), 'included_by_commodity': {kind: sum(r['commodity'] == kind for r in normalized) for kind in ('육류', '농산물')}, 'excluded_by_commodity': {str(kind): sum(r.get('commodity') == kind for r in excluded_rows) for kind in {r.get('commodity') for r in excluded_rows}}, 'unique_rows': len(normalized), 'window_rows': len(history), 'same_floor_rows': len(comparable), 'same_item_floor_rows': len(items), 'same_item_independent_dates': len(groups), 'candidate_methods': list(methods), 'training_dates': len(validation['training_dates']), 'holdout_dates': len(validation['holdout_dates']), 'unmet_validation_checks': validation['unmet_checks'], 'reasons': diagnostic_reasons}
     evidence = {'history': [{k: r.get(k) for k in ('notice', 'date', 'commodity', 'base', 'planned', 'floor', 'rate', 'winning', 'participants')} for r in history], 'item_date_groups': groups, 'recent_item_dates': groups[-6:], 'same_floor_date_groups': date_groups(comparable), 'cutoff': cutoff, 'window_start': start, 'weighting_rule': '최근 동일 품목·하한율 최대 6개 개찰일의 일별 평균에 오래된 순서로 1..N 가중치; 사전 정의 시험 후보이며 검증된 법칙 아님', 'scope': '현재 학교의 수집 자료만 사용; 다른 학교 자료를 수집한 것으로 간주하지 않음'}
     coverage = dict(notice.get('coverage', {}))
-    coverage.update({'collected_rows': len(normalized), 'used_rows': len(history), 'independent_dates': len({r['date'] for r in history}), 'cutoff': cutoff, 'window_start': start, 'excluded_same_day_or_future': sum((r['date'] >= cutoff for r in normalized))})
+    coverage.update({'source_rows': len(rows), 'excluded_rows': len(excluded_rows), 'collected_rows': len(normalized), 'used_rows': len(history), 'independent_dates': len({r['date'] for r in history}), 'cutoff': cutoff, 'window_start': start, 'excluded_same_day_or_future': sum((r['date'] >= cutoff for r in normalized))})
     required = ('notice_verified', 'notice_source_complete', 'qualification_verified', 'correction_verified', 'history_24_months_complete', 'all_pages_complete', 'three_analyses_complete', 'multiple_estimates_verified', 'competition_verified')
     missing = [key for key in required if coverage.get(key) is not True]
     data_required = ('notice_verified', 'notice_source_complete', 'correction_verified', 'history_24_months_complete', 'all_pages_complete')
@@ -470,7 +475,7 @@ def school_token(name):
     return match[1] if match else None
 
 def commodity_classification(explicit=None, title=None):
-    patterns = {'육류': '육류|축산물|축산|돼지고기|소고기|닭고기|돈육|우육', '농산물': '농산|농산물', '수산물': '수산|수산물', '공산품': '공산|가공식품'}
+    patterns = {'육류': '육류|축산물|축산|돼지고기|소고기|닭고기|돈육|우육', '농산물': '농산|농산물', '수산물': '수산|수산물', '공산품': '공산|가공식품', '김치류': '김치류|김치'}
     for text, source in ((explicit, 'explicit_label'), (title, 'title_classification')):
         matches = [kind for kind, pattern in patterns.items() if re.search(pattern, str(text or ''))]
         if matches:
@@ -1247,10 +1252,12 @@ def collect_analyze(number, userid, password, aliases, cost_floor, api_key, mode
     bundle['analysis_cutoff'] = datetime.now(KST).date().isoformat()
     try:
         report = analyze(bundle, cost_floor)
-    except (ValueError, KeyError, TypeError):
+    except ValueError as error:
         missing = [label for key, label in (('base', '기초금액'), ('floor', '낙찰하한율'), ('variation', '예가변동폭')) if bundle.get('notice', {}).get(key) is None]
-        message = '공고 필수 항목 미확인: ' + ', '.join(missing) if missing else '원자료의 금액·날짜·조건 검증 실패'
+        message = '공고 필수 항목 미확인: ' + ', '.join(missing) if missing else str(error)
         raise CollectionError('금액 검산: ' + message) from None
+    except (KeyError, TypeError):
+        raise CollectionError('금액 검산: 자료 구조가 예상 형식과 달라 계산을 중단했습니다') from None
     if api_key:
         try:
             bundle['gemini_review'] = review_candidates(api_key, model, bundle['notice'], report)
@@ -1280,6 +1287,8 @@ def display(bundle, report, prefix):
         st.caption(f"실제 예가율 {main['boundary']:.6f}% 초과 시 산술상 미달. 자릿수만 늘린다고 동가를 피하거나 예측력이 높아지는 것은 아닙니다.")
     else:
         st.caption('AI 근거 검증 또는 자료 확인이 끝나지 않아 추천 입찰가를 보류했습니다. 100%는 아래 비교 기준일 뿐입니다.')
+    counts = report['diagnostics']['included_by_commodity']
+    st.caption(f"과거 자료: 축산물 {counts['육류']}건 · 농산물 {counts['농산물']}건 사용 / 다른 품목 {report['diagnostics']['excluded_rows']}건 제외")
     coverage_labels = {'qualification_verified': '업체 참가자격 증빙', 'correction_verified': '최신 정정 내역', 'history_24_months_complete': '변경 전후 24개월 전체 자료', 'all_pages_complete': '마지막 페이지', 'three_analyses_complete': '발주처·사정률·복수예가', 'multiple_estimates_verified': '복수예가 검산', 'competition_verified': '경쟁업체 전체 목록', 'notice_verified': '공고 조건', 'notice_source_complete': '공고 원문·참가조건'}
     for warning in dict.fromkeys(report['warnings'] + bundle.get('issues', [])):
         for field, label in coverage_labels.items():
