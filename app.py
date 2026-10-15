@@ -706,6 +706,31 @@ class BidQClient:
                 owned_result = {'business_registration_number': '3418703699', 'company': owned[0]['company'], 'published_status': status, 'source_url': source}
         return {'notice_number': refreshed['notice_number'], 'planned': refreshed.get('planned'), 'winning': refreshed.get('winning'), 'date': refreshed.get('date'), 'bidders': parsed['rows'], 'source_url': source, 'state': 'opened' if refreshed.get('planned') is not None else 'unverified', 'owned_result': owned_result, 'completeness': {'notice_exact': True, 'planned_verified': refreshed.get('planned') is not None, 'winning_verified': refreshed.get('winning') is not None, 'bidders': parsed['status'], 'bidders_reason': parsed['reason'], 'owned_status_verified': owned_result is not None}, 'issues': ['업체목록 전체 페이지 미확인; 온담 미표시를 불참·패찰로 판정하지 않음']}
 
+    def _school_detail_fields(self, urls):
+        """Read independent school details concurrently without sharing a session."""
+        if len(urls) < 2 or not self._authenticated or not isinstance(self.session, requests.Session):
+            return [(url, labels(BeautifulSoup(self._request('GET', url).text, 'html.parser'))) for url in urls]
+        cookies = self.session.cookies.copy()
+        headers = self.session.headers.copy()
+        settings = {key: getattr(self.session, key) for key in ('trust_env', 'verify', 'cert', 'proxies')}
+
+        def read(url):
+            session = requests.Session()
+            session.cookies = cookies.copy()
+            session.headers.update(headers)
+            for key, value in settings.items():
+                setattr(session, key, value.copy() if key == 'proxies' else value)
+            client = BidQClient(None, None, session=session, today=self.today, timeout=self.timeout)
+            client._authenticated = True
+            try:
+                html = client._request('GET', url).text
+                return url, labels(BeautifulSoup(html, 'html.parser'))
+            finally:
+                client.close()
+
+        with ThreadPoolExecutor(max_workers=min(4, len(urls))) as pool:
+            return list(pool.map(read, urls))
+
     def discover_names(self, name):
         token = school_token(name)
         if not token:
@@ -743,13 +768,15 @@ class BidQClient:
             for more in soup.find_all(['a', 'button'], string=re.compile('더보기')):
                 if not more.has_attr('disabled') and (not more.get('href', '').startswith('/bidq/bids/list')):
                     unmapped_more = True
+            detail_urls = []
             for url in self._detail_links(html):
                 if url in detail_seen:
                     continue
                 detail_seen.add(url)
                 if len(detail_seen) > 1000:
                     raise CollectionError('학교명 구매검색 상세 확인 1000건 한도 초과')
-                fields = labels(BeautifulSoup(self._request('GET', url).text, 'html.parser'))
+                detail_urls.append(url)
+            for url, fields in self._school_detail_fields(detail_urls):
                 org = choose(fields, '발주기관', '발주처', '공고기관')
                 if org:
                     org = re.split('발주처\\s*분석|사정[률율]\\s*분석', org)[0].strip()
@@ -863,9 +890,15 @@ class BidQClient:
             frequency_rows.extend(found)
         issues = []
         rows, seen, competition = ([], set(), [])
+        eligible_raw_rows = []
+        excluded_commodity_rows = 0
         by_notice = {}
         for raw in raw_rows:
             row = canonical_row(raw)
+            if row['commodity'] in {'수산물', '공산품', '김치류'}:
+                rows.append(row)
+                excluded_commodity_rows += 1
+                continue
             if row['bidid'] and any((row.get(key) is None for key in ('notice', 'base', 'planned', 'floor'))):
                 url = BASE + '/bidq/bids/detail/suc?bidid=' + quote(str(row['bidid']), safe='') + '&bidtype=pur'
                 html = self._request('GET', url).text
@@ -883,6 +916,12 @@ class BidQClient:
                 row['raw_fields'] = detail['raw_fields']
                 if re.search('육류|축산|돼지|소고기|닭고기', row['title']):
                     competition.append({'notice_number': row['notice_number'], 'source_url': url, **parse_competitors(html)})
+            if row['commodity'] in {'수산물', '공산품', '김치류'}:
+                rows.append(row)
+                excluded_commodity_rows += 1
+                continue
+            if row['commodity'] in {'육류', '농산물'}:
+                eligible_raw_rows.append(raw)
             identity = row['notice_number'] or row['bidid']
             if not identity:
                 issues.append('공고번호/BidQ ID 없는 개찰행: 중복 및 상세 대조 미확인')
@@ -912,17 +951,17 @@ class BidQClient:
         issues.extend(('현재 공고 ' + key + ' 원문 미확인' for key in required if notice.get(key) is None))
         if not alias_verified:
             issues.append('동명 학교/행정구역 변경 기관 동일성 추가 확인 필요')
-        if any((row['planned_rate'] is None for row in rows)):
+        if any((row['planned_rate'] is None for row in rows if row['commodity'] in {'육류', '농산물'})):
             issues.append('일부 예정가격/기초금액 미확인: success_pct를 예가율로 사용하지 않음')
         missing = {'status': 'missing', 'reason': '실제 화면/API 매핑 및 마지막 페이지를 확인하지 못함'}
-        multi_records = [{'notice': choose(raw, 'notinum', 'notice', 'notice_number'), **multiple_estimates(raw)} for raw in raw_rows]
-        multi_complete = len(multi_records) == org['total'] and all((record['verified'] for record in multi_records))
+        multi_records = [{'notice': choose(raw, 'notinum', 'notice', 'notice_number'), **multiple_estimates(raw)} for raw in eligible_raw_rows]
+        multi_complete = bool(eligible_raw_rows) and all((record['verified'] for record in multi_records))
         org_ids = {choose(raw, 'notinum', 'notice', 'notice_number', 'bidid') for raw in raw_rows}
         freq_ids = {choose(raw, 'notinum', 'notice', 'notice_number', 'bidid') for raw in frequency_rows}
         if org_ids != freq_ids:
             raise CollectionError('발주처/사정률 분석 공고 집합 불일치')
         freq_scope = {'status': 'complete', 'parts': frequency_parts, 'collected': len(frequency_rows), 'total': sum((part.get('total', 0) for part in frequency_parts))}
-        coverage = {'org': org, 'freq': freq_scope, 'multi': {'status': 'complete' if multi_complete else 'partial', 'records': multi_records, 'total': org['total'], 'collected': len(multi_records), 'source': 'opened-data.multispares_pct; type is a frontend store branch only'}, 'competition': {'status': 'complete' if competition_complete else 'partial' if competition else 'missing', 'notices': competition, 'sample_rule': '최근 동일 품목·하한율 최대 3개 공고의 전체 참여업체', 'expected_notices': len(comparable), 'collected_notices': len(competition), 'reason': None if competition_complete else '비교 공고 또는 업체 총건수·최종페이지 미확인'}, 'notice_source': source_evidence, 'aliases': {**getattr(self, '_alias_discovery', {}), 'names': names, 'counts': alias_counts, 'identity_verified': alias_verified}, 'captured_at': datetime.now(timezone(timedelta(hours=9))).isoformat(timespec='seconds')}
+        coverage = {'org': org, 'freq': freq_scope, 'multi': {'status': 'complete' if multi_complete else 'partial', 'records': multi_records, 'total': len(eligible_raw_rows), 'collected': len(multi_records), 'source': 'opened-data.multispares_pct; type is a frontend store branch only'}, 'competition': {'status': 'complete' if competition_complete else 'partial' if competition else 'missing', 'notices': competition, 'sample_rule': '최근 동일 품목·하한율 최대 3개 공고의 전체 참여업체', 'expected_notices': len(comparable), 'collected_notices': len(competition), 'reason': None if competition_complete else '비교 공고 또는 업체 총건수·최종페이지 미확인'}, 'notice_source': source_evidence, 'aliases': {**getattr(self, '_alias_discovery', {}), 'names': names, 'counts': alias_counts, 'identity_verified': alias_verified}, 'captured_at': datetime.now(timezone(timedelta(hours=9))).isoformat(timespec='seconds'), 'excluded_commodity_rows': excluded_commodity_rows}
         coverage.update({'notice_verified': all((notice.get(key) is not None for key in ('notice', 'name', 'base', 'floor', 'variation', 'deadline'))), 'qualification_verified': False, 'qualification_source_complete': source_evidence['qualification_source_complete'], 'notice_source_complete': source_evidence['notice_source_complete'], 'correction_verified': source_evidence['correction_verified'], 'history_24_months_complete': months == 24 and alias_verified and all((part.get('status') == 'complete' and part.get('unique_rows_verified') for part in parts + frequency_parts)), 'all_pages_complete': alias_verified and all((part.get('last_page_verified') for part in parts + frequency_parts)), 'three_analyses_complete': False, 'multiple_estimates_verified': False, 'competition_verified': competition_complete})
         coverage['multiple_estimates_verified'] = multi_complete
         coverage['three_analyses_complete'] = multi_complete and all((part.get('status') == 'complete' for part in parts + frequency_parts))
