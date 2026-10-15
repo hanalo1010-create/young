@@ -883,7 +883,7 @@ class BidQClient:
         headers = {"Content-Type": "application/json", "Origin": BASE,
                    "Referer": BASE + "/bidq/analysis/" + graph_type}
         graph = self._request("POST", "/bidq/analysis/common-api/org-graph-data", json=params, headers=headers).json()
-        reported = number(graph.get("total")) if isinstance(graph, dict) else None
+        reported = client_number(graph.get("total")) if isinstance(graph, dict) else None
         if reported is None or reported < 0 or reported != int(reported):
             raise CollectionError("그래프 API 총건수 미확인")
         total, rows, pages = int(reported), [], 0
@@ -935,7 +935,7 @@ class BidQClient:
                     headers={"Origin": BASE, "Referer": BASE + "/bidq/analysis/freq"}).json()
                 if not isinstance(freq, list) or any(not isinstance(item, dict) or "cate" not in item or "24m" not in item for item in freq):
                     raise CollectionError("사정률 빈도48 응답 스키마 미확인")
-                counts = [number(item["24m"].get("count")) if isinstance(item["24m"], dict) else None for item in freq]
+                counts = [client_number(item["24m"].get("count")) if isinstance(item["24m"], dict) else None for item in freq]
                 if any(count is None or count < 0 or count != int(count) for count in counts) or sum(counts) != scope["total"]:
                     raise CollectionError("사정률 24개월 빈도 합계와 조회 총건수 불일치")
                 scope["frequency48"] = freq
