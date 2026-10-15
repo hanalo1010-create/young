@@ -885,6 +885,32 @@ class BidQClient:
         with ThreadPoolExecutor(max_workers=min(4, len(tasks))) as pool:
             return list(pool.map(read, tasks))
 
+    def _historical_detail_pages(self, urls):
+        """Fetch relevant historical details concurrently with isolated sessions."""
+        urls = list(dict.fromkeys(urls))
+        if len(urls) < 2 or not self._authenticated or not isinstance(self.session, requests.Session):
+            return {url: self._request('GET', url).text for url in urls}
+
+        cookies = self.session.cookies.copy()
+        headers = self.session.headers.copy()
+        settings = {key: getattr(self.session, key) for key in ('trust_env', 'verify', 'cert', 'proxies')}
+
+        def read(url):
+            session = requests.Session()
+            session.cookies = cookies.copy()
+            session.headers.update(headers)
+            for key, value in settings.items():
+                setattr(session, key, value.copy() if key == 'proxies' else value)
+            client = BidQClient(None, None, session=session, today=self.today, timeout=self.timeout)
+            client._authenticated = True
+            try:
+                return client._request('GET', url).text
+            finally:
+                client.close()
+
+        with ThreadPoolExecutor(max_workers=min(4, len(urls))) as pool:
+            return dict(zip(urls, pool.map(read, urls)))
+
     def collect(self, notice_number, legacy_names=None, months=24):
         start = subtract_months(self.today, months)
         if not self._authenticated:
@@ -925,15 +951,20 @@ class BidQClient:
         eligible_raw_rows = []
         excluded_commodity_rows = 0
         by_notice = {}
-        for raw in raw_rows:
-            row = canonical_row(raw)
+        canonical_rows = [(raw, canonical_row(raw)) for raw in raw_rows]
+        detail_urls = [BASE + '/bidq/bids/detail/suc?bidid=' + quote(str(row['bidid']), safe='') + '&bidtype=pur'
+                       for _, row in canonical_rows
+                       if row['commodity'] not in {'수산물', '공산품', '김치류'} and row['bidid']
+                       and any(row.get(key) is None for key in ('notice', 'base', 'planned', 'floor'))]
+        detail_pages = self._historical_detail_pages(detail_urls)
+        for raw, row in canonical_rows:
             if row['commodity'] in {'수산물', '공산품', '김치류'}:
                 rows.append(row)
                 excluded_commodity_rows += 1
                 continue
             if row['bidid'] and any((row.get(key) is None for key in ('notice', 'base', 'planned', 'floor'))):
                 url = BASE + '/bidq/bids/detail/suc?bidid=' + quote(str(row['bidid']), safe='') + '&bidtype=pur'
-                html = self._request('GET', url).text
+                html = detail_pages[url]
                 detail = parse_notice(html, url, row['notice_number'])
                 for key in ('notice_number', 'notice', 'id', 'base', 'planned', 'planned_rate', 'winning', 'floor', 'name'):
                     if detail[key] is not None:
