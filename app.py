@@ -843,6 +843,48 @@ class BidQClient:
                 raise CollectionError('발주처 마지막 페이지/총건수 불일치')
         raise CollectionError('발주처 500페이지 안전 한도 초과: 일부 자료를 완료로 반환하지 않습니다.')
 
+    def _history_parts(self, names, start):
+        """Fetch independent institution and graph scopes with isolated sessions."""
+        tasks = [(name, graph_type) for graph_type in ('orgi', 'freq') for name in names]
+
+        def collect_scope(client, name, graph_type):
+            found, scope = client._opened([name], start, self.today, graph_type)
+            if graph_type == 'freq':
+                params = client._params([name], start, self.today, 'freq')
+                freq = client._request('POST', '/bidq/analysis/common-api/org-point-freq48',
+                    json=params, headers={'Origin': BASE, 'Referer': BASE + '/bidq/analysis/freq'}).json()
+                if not isinstance(freq, list) or any(not isinstance(item, dict) or 'cate' not in item or '24m' not in item for item in freq):
+                    raise CollectionError('사정률 빈도48 응답 스키마 미확인')
+                counts = [client_number(item['24m'].get('count')) if isinstance(item['24m'], dict) else None for item in freq]
+                if any(count is None or count < 0 or count != int(count) for count in counts) or sum(counts) != scope['total']:
+                    raise CollectionError('사정률 24개월 빈도 합계와 조회 총건수 불일치')
+                scope['frequency48'] = freq
+            return found, scope
+
+        if len(tasks) < 2 or not self._authenticated or not isinstance(self.session, requests.Session):
+            return [collect_scope(self, *task) for task in tasks]
+
+        cookies = self.session.cookies.copy()
+        headers = self.session.headers.copy()
+        settings = {key: getattr(self.session, key) for key in ('trust_env', 'verify', 'cert', 'proxies')}
+
+        def read(task):
+            name, graph_type = task
+            session = requests.Session()
+            session.cookies = cookies.copy()
+            session.headers.update(headers)
+            for key, value in settings.items():
+                setattr(session, key, value.copy() if key == 'proxies' else value)
+            client = BidQClient(None, None, session=session, today=self.today, timeout=self.timeout)
+            client._authenticated = True
+            try:
+                return collect_scope(client, name, graph_type)
+            finally:
+                client.close()
+
+        with ThreadPoolExecutor(max_workers=min(4, len(tasks))) as pool:
+            return list(pool.map(read, tasks))
+
     def collect(self, notice_number, legacy_names=None, months=24):
         start = subtract_months(self.today, months)
         if not self._authenticated:
@@ -866,26 +908,16 @@ class BidQClient:
             if name not in names:
                 names.append(name)
                 alias_verified = False
+        self.stage = '24개월 발주처·사정률 분석 수집'
+        history_parts = self._history_parts(names, start)
         raw_rows, parts, alias_counts = ([], [], [])
-        for name in names:
-            self.stage = '24개월 발주처 분석 수집'
-            found, scope = self._opened([name], start, self.today)
+        for name, (found, scope) in zip(names, history_parts[:len(names)]):
             raw_rows.extend(found)
             parts.append(scope)
             alias_counts.append({'name': name, 'total': scope.get('total'), 'collected': len(found), 'pages': scope.get('pages'), 'status': scope.get('status')})
         org = {'status': 'complete', 'total': sum((part.get('total', 0) for part in parts)), 'collected': len(raw_rows), 'by_institution': alias_counts, 'parts': parts, 'start': start.isoformat(), 'end': self.today.isoformat(), 'names': names}
         frequency_rows, frequency_parts = ([], [])
-        for name in names:
-            self.stage = '24개월 사정률 분석 수집'
-            found, scope = self._opened([name], start, self.today, 'freq')
-            params = self._params([name], start, self.today, 'freq')
-            freq = self._request('POST', '/bidq/analysis/common-api/org-point-freq48', json=params, headers={'Origin': BASE, 'Referer': BASE + '/bidq/analysis/freq'}).json()
-            if not isinstance(freq, list) or any((not isinstance(item, dict) or 'cate' not in item or '24m' not in item for item in freq)):
-                raise CollectionError('사정률 빈도48 응답 스키마 미확인')
-            counts = [client_number(item['24m'].get('count')) if isinstance(item['24m'], dict) else None for item in freq]
-            if any((count is None or count < 0 or count != int(count) for count in counts)) or sum(counts) != scope['total']:
-                raise CollectionError('사정률 24개월 빈도 합계와 조회 총건수 불일치')
-            scope['frequency48'] = freq
+        for found, scope in history_parts[len(names):]:
             frequency_parts.append(scope)
             frequency_rows.extend(found)
         issues = []
