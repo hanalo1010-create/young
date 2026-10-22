@@ -486,6 +486,8 @@ def choose(mapping, *keys):
 
 def school_token(name):
     match = re.search('([가-힣A-Za-z0-9]+(?:초등학교|중학교|고등학교|유치원))', name or '')
+    if not match:
+        match = re.search(r'([가-힣A-Za-z0-9]+학교)(?=\s|\(|$)', name or '')
     return match[1] if match else None
 
 def commodity_classification(explicit=None, title=None):
@@ -1451,8 +1453,10 @@ def review_candidates(api_key, model='gemini-3.8-flash', notice=None, report=Non
     if not abstain:
         selected = next((c for c in payload['candidates'] if c['method'] == result['selected_method']))
         data_complete = all((payload['coverage'][key] for key in PRICE_COVERAGE_KEYS))
-        if not data_complete or selected['cost_acceptable'] is False:
-            return _result('rejected', model, '자료 검증 또는 최저수용가 조건이 충족되지 않아 추천을 보류합니다')
+        if not data_complete:
+            return _result('rejected', model, '가격 산정 핵심 자료 검증이 미완료되어 추천을 보류합니다')
+        if selected['cost_acceptable'] is False:
+            return _result('rejected', model, '선택 후보가 입력한 최저수용가보다 낮아 추천을 보류합니다')
     incomplete = not all(payload['coverage'].values())
     if incomplete and re.search('최종\\s*(?:추천|확정|후보)|검증\\s*완료', joined):
         return _result('rejected', model, '필수 확인 미완료 상태에서 확정 표현을 사용했습니다')
