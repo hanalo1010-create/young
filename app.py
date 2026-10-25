@@ -236,8 +236,9 @@ def report_analysis(notice, rows, cost_floor=None):
     coverage.update({'source_rows': len(rows), 'excluded_rows': len(excluded_rows), 'collected_rows': len(normalized), 'used_rows': len(history), 'independent_dates': len({r['date'] for r in history}), 'cutoff': cutoff, 'window_start': start, 'excluded_same_day_or_future': sum((r['date'] >= cutoff for r in normalized))})
     required = ('notice_verified', 'notice_source_complete', 'qualification_verified', 'correction_verified', 'history_24_months_complete', 'all_pages_complete', 'three_analyses_complete', 'multiple_estimates_verified', 'competition_verified')
     missing = [key for key in required if coverage.get(key) is not True]
-    data_required = ('notice_verified', 'notice_source_complete', 'correction_verified', 'history_24_months_complete', 'all_pages_complete')
-    data_missing = [key for key in data_required if coverage.get(key) is not True]
+    data_required = ('notice_verified', 'pricing_source_complete', 'correction_verified', 'history_24_months_complete', 'all_pages_complete')
+    pricing_source_complete = coverage.get('pricing_source_complete', coverage.get('notice_source_complete'))
+    data_missing = [key for key in data_required if (pricing_source_complete if key == 'pricing_source_complete' else coverage.get(key)) is not True]
     eligibility = 'verified' if coverage.get('qualification_verified') is True else 'user_documents_required'
     identity = {'engine': ENGINE_VERSION, 'notice': {'id': str(notice.get('notice', notice.get('notice_number', notice.get('code', '')))), 'base': str(base), 'floor': str(floor), 'commodity': notice['commodity'], 'variation': str(variation), 'cutoff': cutoff}, 'rows': [{key: str(row[key]) if isinstance(row[key], D) else row[key] for key in ('notice', 'date', 'commodity', 'base', 'planned', 'floor', 'winning')} for row in history], 'cost_floor': None if min_cost is None else str(min_cost)}
     fingerprint = hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
@@ -312,6 +313,7 @@ def notice_source_evidence(html, notice):
     floor_match = re.search('예정가격의\\s*\\[?\\s*(\\d+(?:\\.\\d+)?)\\s*\\]?\\s*%', award)
     floor = float(floor_match[1]) if floor_match else None
     matching = bool(current and mirrored == current and (base == notice.get('base')) and (floor == notice.get('floor')))
+    pricing_complete = matching and bool(award)
     required = ('제한조건', '자격제한', '납품기간/시간', '납품장소', '낙찰방식')
     complete = matching and all((fields.get(key) for key in required))
     history = soup.select_one('#history_popover_content')
@@ -337,7 +339,7 @@ def notice_source_evidence(html, notice):
         chain = {family + '-' + str(i) for i in range(int(revision_text) + 1)}
         same_family = {item for item in correction_ids if item.rpartition('-')[0] == family}
         correction_complete = same_family == chain and set(linked_ids) >= chain
-    return {'source_url': notice.get('source_url'), 'notice_number': current, 'mirror_notice_number': mirrored, 'mirrored_fields': fields, 'notice_source_complete': complete, 'conditions_source_complete': complete, 'qualification_source_complete': complete, 'qualification_verified': False, 'business_eligibility': 'unknown', 'eligibility_reason': '공고의 참가조건은 수집했으나 업체 인증·소재지·수의계약 자격은 증빙 미확인', 'correction_verified': correction_complete, 'correction_notice_numbers': correction_ids, 'correction_links': correction_links, 'attachments_external_not_fetched': [a.get_text(' ', strip=True) for a in source.select('a[href]')] if source else [], 'external_original_verified': False, 'correction_reason': '비드큐 게시 정정 내역 확인' if correction_complete else '정정 공고 연결 및 최신 차수 확인 필요'}
+    return {'source_url': notice.get('source_url'), 'notice_number': current, 'mirror_notice_number': mirrored, 'mirrored_fields': fields, 'pricing_source_complete': pricing_complete, 'notice_source_complete': complete, 'conditions_source_complete': complete, 'qualification_source_complete': complete, 'qualification_verified': False, 'business_eligibility': 'unknown', 'eligibility_reason': '공고의 참가조건은 수집했으나 업체 인증·소재지·수의계약 자격은 증빙 미확인', 'correction_verified': correction_complete, 'correction_notice_numbers': correction_ids, 'correction_links': correction_links, 'attachments_external_not_fetched': [a.get_text(' ', strip=True) for a in source.select('a[href]')] if source else [], 'external_original_verified': False, 'correction_reason': '비드큐 게시 정정 내역 확인' if correction_complete else '정정 공고 연결 및 최신 차수 확인 필요'}
 
 def ne_competitor_page(html):
     soup = BeautifulSoup(html, 'html.parser')
@@ -1177,6 +1179,7 @@ class BidQClient:
         coverage.update({"notice_verified": all(notice.get(key) is not None for key in ("notice", "name", "base", "floor", "variation", "deadline")),
             "qualification_verified": False, "qualification_source_complete": source_evidence['qualification_source_complete'],
             'notice_source_complete': source_evidence['notice_source_complete'],
+            'pricing_source_complete': source_evidence['pricing_source_complete'],
             "correction_verified": source_evidence['correction_verified'],
             "history_24_months_complete": months == 24 and alias_verified and
                 all(part.get("status") == "complete" and part.get("unique_rows_verified") for part in parts + frequency_parts),
@@ -1194,10 +1197,10 @@ class BidQClient:
                 "issues": list(dict.fromkeys(issues)), "verified": False}
 
 ALLOWED_METHODS = {'fixed_100', 'all_mean', 'item_mean', 'item_median', 'recent_item3', 'item_date_mean', 'recent_item_weighted'}
-COVERAGE_KEYS = ('notice_verified', 'notice_source_complete', 'qualification_verified', 'correction_verified',
+COVERAGE_KEYS = ('notice_verified', 'notice_source_complete', 'pricing_source_complete', 'qualification_verified', 'correction_verified',
                  'history_24_months_complete', 'all_pages_complete', 'three_analyses_complete',
                  'multiple_estimates_verified', 'competition_verified')
-PRICE_COVERAGE_KEYS = ('notice_verified', 'notice_source_complete', 'correction_verified',
+PRICE_COVERAGE_KEYS = ('notice_verified', 'pricing_source_complete', 'correction_verified',
                        'history_24_months_complete', 'all_pages_complete')
 STAT_KEYS = ('n', 'independent_dates', 'mean', 'median', 'stdev', 'min', 'max',
              'mae', 'below_floor', 'above_first', 'at_or_below_first', 'first_unknown')
