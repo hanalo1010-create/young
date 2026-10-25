@@ -669,6 +669,14 @@ class BidQClient:
             response = self.session.request(method, url, timeout=self.timeout, allow_redirects=False, **kwargs)
             response.raise_for_status()
             if response.status_code not in {301, 302, 303, 307, 308}:
+                # Some BidQ fragments contain CP949 bytes despite a UTF-8 header.
+                if '\ufffd' in response.text and response.content:
+                    try:
+                        korean = response.content.decode('cp949')
+                    except UnicodeDecodeError:
+                        korean = ''
+                    if any(label in korean for label in ('공고번호', '기초가격', '낙찰방식', '자격제한')):
+                        response.encoding = 'cp949'
                 if cache_key is not None and url == cache_key and response.status_code == 200:
                     self._detail_response_cache[cache_key] = response
                 return response
